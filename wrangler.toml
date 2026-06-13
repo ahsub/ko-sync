@@ -3,5 +3,5 @@ main = "ko-sync-worker.js"
 compatibility_date = "2024-01-01"
 
 kv_namespaces = [
-  { binding = "KO_SYNC_KV", id = "DEINE_KV_NAMESPACE_ID_HIER" }
+  { binding = "KO_SYNC_KV", id = "86c05f66e32346b99e720d861fedd1de" }
 ]
