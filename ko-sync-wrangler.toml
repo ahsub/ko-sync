@@ -1,0 +1,7 @@
+name = "ko-sync"
+main = "ko-sync-worker.js"
+compatibility_date = "2024-01-01"
+
+kv_namespaces = [
+  { binding = "KO_SYNC_KV", id = "DEINE_KV_NAMESPACE_ID_HIER" }
+]
