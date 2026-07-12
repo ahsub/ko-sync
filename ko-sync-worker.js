@@ -1,90 +1,168 @@
-// ko-sync-worker.js v1.1
-// Cloudflare Worker — KV-Sync für KO-Scanner
-// Endpoints: GET/POST /sync/:key, GET /sync/status
- 
+// ko-sync-worker.js v2.0
+// Cloudflare Worker — KV-Sync für UnderlyingIQ mit Token-Isolation
+// 
+// ÄNDERUNG v2.0 (12.07.2026): Token-basierte Nutzer-Isolation
+// Jeder Nutzer setzt einmalig ein selbst gewähltes UIQ-Sync-Token (6-32 Zeichen).
+// Alle KV-Keys werden als `{token}:{key}` gespeichert — vollständige Datentrennung
+// zwischen verschiedenen Nutzern ohne serverseitige Benutzerverwaltung.
+//
+// Header: X-UIQ-Token: <token>
+// Erlaubte Keys: watchlist, backlog_winners, backlog_oversold, backlog_tracking,
+//                scan_results, admin_settings, alert_watchlist
+// Endpoints:
+//   GET  /sync/status          → Status aller eigenen Keys
+//   GET  /sync/:key            → Eigenen Key lesen
+//   POST /sync/:key            → Eigenen Key schreiben
+//   DELETE /sync/all           → Alle eigenen Keys löschen (Konto-Reset)
+
+const ALLOWED_KEYS = new Set([
+  'watchlist', 'backlog_winners', 'backlog_oversold', 'backlog_tracking',
+  'scan_results', 'admin_settings', 'alert_watchlist'
+]);
+
+const TOKEN_MIN = 6;
+const TOKEN_MAX = 32;
+// Erlaubte Zeichen: alphanumerisch + Bindestrich + Unterstrich
+const TOKEN_RE  = /^[a-zA-Z0-9_\-]+$/;
+
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
+    const url  = new URL(request.url);
     const path = url.pathname;
- 
-    // CORS headers
+
     const cors = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Origin':  '*',
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, X-UIQ-Token',
       'Content-Type': 'application/json'
     };
- 
+
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: cors });
     }
- 
-    // GET /sync/status — Status aller Keys
+
+    // ── Token lesen + validieren ──────────────────────────────────────────────
+    const token = (request.headers.get('X-UIQ-Token') || '').trim();
+
+    // /sync/status und Schreib-/Lesezugriffe brauchen Token
+    // Einzige Ausnahme: OPTIONS (oben bereits behandelt)
+    if (!token) {
+      return new Response(JSON.stringify({
+        error:   'Kein UIQ-Sync-Token gesetzt.',
+        hint:    'X-UIQ-Token Header fehlt. Token in UIQ-Einstellungen unter Cloud Sync setzen.',
+        code:    'NO_TOKEN'
+      }), { status: 401, headers: cors });
+    }
+
+    if (token.length < TOKEN_MIN || token.length > TOKEN_MAX || !TOKEN_RE.test(token)) {
+      return new Response(JSON.stringify({
+        error:  'Ungültiges UIQ-Sync-Token.',
+        hint:   `Token: ${TOKEN_MIN}-${TOKEN_MAX} Zeichen, nur a-z A-Z 0-9 _ -`,
+        code:   'INVALID_TOKEN'
+      }), { status: 400, headers: cors });
+    }
+
+    // Alle KV-Keys mit Token-Prefix isolieren
+    const pfx = token.toLowerCase() + ':';  // z.B. "axel2026:watchlist"
+
+    // ── GET /sync/status — Status aller eigenen Keys ──────────────────────────
     if (path === '/sync/status' && request.method === 'GET') {
-      const keys = ['watchlist', 'backlog_winners', 'backlog_oversold', 'backlog_tracking', 'scan_results', 'admin_settings', 'alert_watchlist'];
+      const keys = [...ALLOWED_KEYS];
       const result = await Promise.all(keys.map(async (key) => {
         try {
-          const val = await env.KO_SYNC_KV.getWithMetadata(key);
+          const val = await env.KO_SYNC_KV.getWithMetadata(pfx + key);
           return {
             key,
-            exists: val.value !== null,
+            exists:     val.value !== null,
             updated_at: val.metadata?.updated_at || null,
-            size: val.value ? val.value.length : 0
+            size:       val.value ? val.value.length : 0
           };
         } catch(e) {
           return { key, exists: false, updated_at: null, size: 0 };
         }
       }));
       return new Response(JSON.stringify({
-        status: 'ok',
-        service: 'ko-sync v1.1',
-        time: new Date().toISOString(),
-        keys: result
+        status:  'ok',
+        service: 'ko-sync v2.0',
+        token:   token.slice(0, 3) + '***',  // nur Anfang zurückgeben (kein Full-Leak)
+        time:    new Date().toISOString(),
+        keys:    result
       }), { headers: cors });
     }
- 
-    // Match /sync/:key
+
+    // ── DELETE /sync/all — alle eigenen Keys löschen ──────────────────────────
+    if (path === '/sync/all' && request.method === 'DELETE') {
+      const keys   = [...ALLOWED_KEYS];
+      let deleted = 0;
+      for (const key of keys) {
+        try {
+          await env.KO_SYNC_KV.delete(pfx + key);
+          deleted++;
+        } catch(e) { /* silent */ }
+      }
+      return new Response(JSON.stringify({
+        ok: true, deleted, token: token.slice(0, 3) + '***'
+      }), { headers: cors });
+    }
+
+    // ── Match /sync/:key ──────────────────────────────────────────────────────
     const match = path.match(/^\/sync\/([a-z0-9_]+)$/);
     if (!match) {
-      return new Response(JSON.stringify({ error: 'Not found', path }), { status: 404, headers: cors });
+      return new Response(JSON.stringify({ error: 'Not found', path }), {
+        status: 404, headers: cors
+      });
     }
     const key = match[1];
- 
-    // GET /sync/:key — Daten lesen
+
+    // Nur erlaubte Keys
+    if (key !== 'status' && !ALLOWED_KEYS.has(key)) {
+      return new Response(JSON.stringify({
+        error: `Unbekannter Key: ${key}`,
+        allowed: [...ALLOWED_KEYS]
+      }), { status: 400, headers: cors });
+    }
+
+    const kvKey = pfx + key;  // z.B. "axel2026:watchlist"
+
+    // ── GET /sync/:key ────────────────────────────────────────────────────────
     if (request.method === 'GET') {
       try {
-        const result = await env.KO_SYNC_KV.getWithMetadata(key, { type: 'json' });
+        const result = await env.KO_SYNC_KV.getWithMetadata(kvKey, { type: 'json' });
         if (result.value === null) {
-          return new Response(JSON.stringify({ key, data: null, updated_at: null }), { headers: cors });
+          return new Response(JSON.stringify({ key, data: null, updated_at: null }),
+            { headers: cors });
         }
         return new Response(JSON.stringify({
           key,
-          data: result.value,
+          data:       result.value,
           updated_at: result.metadata?.updated_at || null
         }), { headers: cors });
       } catch(e) {
-        return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: cors });
+        return new Response(JSON.stringify({ error: e.message }), {
+          status: 500, headers: cors
+        });
       }
     }
- 
-    // POST /sync/:key — Daten schreiben
+
+    // ── POST /sync/:key ───────────────────────────────────────────────────────
     if (request.method === 'POST') {
       try {
-        const body = await request.json();
+        const body       = await request.json();
         const updated_at = Date.now();
-        await env.KO_SYNC_KV.put(key, JSON.stringify(body.data), {
-          metadata: { updated_at }
+        await env.KO_SYNC_KV.put(kvKey, JSON.stringify(body.data), {
+          metadata: { updated_at, token_prefix: token.slice(0, 3) }
         });
-        return new Response(JSON.stringify({ ok: true, key, updated_at }), { headers: cors });
+        return new Response(JSON.stringify({ ok: true, key, updated_at }),
+          { headers: cors });
       } catch(e) {
-        return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: cors });
+        return new Response(JSON.stringify({ error: e.message }), {
+          status: 500, headers: cors
+        });
       }
     }
- 
-    return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405, headers: cors });
+
+    return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+      status: 405, headers: cors
+    });
   }
 };
- 
-
-
-
