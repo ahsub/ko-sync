@@ -89,6 +89,20 @@ export default {
       }
     }
 
+    // ── GET /public/daily_market_snapshot_us — NYSE-Lauf Briefing ──────────────
+    if (path === '/public/daily_market_snapshot_us' && request.method === 'GET') {
+      try {
+        const raw = await env.KO_SYNC_KV.get('daily_market_snapshot_us', { type: 'text' });
+        if (!raw) return new Response(JSON.stringify({ ok: false, reason: 'not_yet_generated' }),
+          { status: 404, headers: cors });
+        return new Response(raw, {
+          headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' }
+        });
+      } catch(e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: cors });
+      }
+    }
+
     // ── Token lesen + validieren ──────────────────────────────────────────────
     const token = (request.headers.get('X-UIQ-Token') || '').trim();
 
