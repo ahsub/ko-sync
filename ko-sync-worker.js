@@ -41,6 +41,25 @@ export default {
       return new Response(null, { status: 204, headers: cors });
     }
 
+
+    // ── GET /public/master_market_data — öffentlich, kein Token nötig ─────────
+    // Liest master_market_data direkt aus KV (read-only, kein User-Prefix).
+    // Wird von loadKVMasterData() im Frontend genutzt.
+    if (path === '/public/master_market_data' && request.method === 'GET') {
+      try {
+        const raw = await env.KO_SYNC_KV.get('master_market_data', { type: 'text' });
+        if (!raw) {
+          return new Response(JSON.stringify({ error: 'master_market_data nicht im KV' }),
+            { status: 404, headers: cors });
+        }
+        return new Response(raw, {
+          headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' }
+        });
+      } catch(e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: cors });
+      }
+    }
+
     // ── Token lesen + validieren ──────────────────────────────────────────────
     const token = (request.headers.get('X-UIQ-Token') || '').trim();
 
