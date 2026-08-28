@@ -1,4 +1,4 @@
-// ko-sync-worker.js v2.1
+// ko-sync-worker.js v2.2
 // Cloudflare Worker — KV-Sync für UnderlyingIQ mit Token-Isolation
 // 
 // ÄNDERUNG v2.0 (12.07.2026): Token-basierte Nutzer-Isolation
@@ -9,29 +9,29 @@
 // ÄNDERUNG v2.1 (27.08.2026, Legal-Briefing-Audit Backlog №61 in SUITE.md):
 // Die drei /public/*-Endpunkte (master_market_data, options_watchlist,
 // daily_market_snapshot[_us]) waren bisher vollstaendig unauthentifiziert —
-// "oeffentlich, kein Token noetig" war woertlich im Code kommentiert. Das
-// betraf u.a. die KI-angereicherten Trade-Parameter (trigger/stopLoss/target/
-// positionPct/leverageRec in masterShortlist, strikeSuggestion/dte/deltaTarget/
-// premiumEstimate in optionsWatchlist) — diese waren fuer JEDEN im Internet
-// abrufbar, ganz ohne Login/Beta-Zugang. Jetzt: STATIC_TOKEN oder OWNER_TOKEN
-// per Authorization-Header erforderlich (gleiches Schema wie ko-ai.js), UND
-// zusaetzlich werden die konkreten KI-Zahlenfelder in masterShortlist/
-// optionsWatchlist fuer Nicht-Owner (STATIC_TOKEN) aus der Antwort entfernt —
-// nur Strategie-Name, Risikoklasse und die ohnehin deskriptiv gehaltenen
-// note/keyRisk-Saetze bleiben sichtbar. Owner (OWNER_TOKEN) erhaelt weiterhin
-// die vollstaendigen Felder unveraendert. Grund fuer die Aenderung: Axels
-// eigene Beta-Tester-Kostenkontrolle (kein taeglich neu generiertes Morning
-// Briefing pro Nutzer) haengt nicht am fehlenden Login, sondern daran, dass
-// der Aggregator-Batch nur einmal taeglich generiert — ein Lesezugriff auf
-// bereits fertige KV-Daten kostet nichts zusaetzlich, ob mit oder ohne Token.
+// "oeffentlich, kein Token noetig" war woertlich im Code kommentiert. Jetzt:
+// STATIC_TOKEN oder OWNER_TOKEN per Authorization-Header erforderlich (gleiches
+// Schema wie ko-ai.js), UND zusaetzlich werden die konkreten KI-Zahlenfelder
+// fuer Nicht-Owner aus der Antwort entfernt.
+//
+// ÄNDERUNG v2.2 (28.08.2026, Legal-Briefing-Audit Backlog №62-Vorarbeit,
+// Options-Desk-Redesign): market_aggregator.py liefert optionsWatchlist[].ki
+// jetzt als Decision-Support-Struktur (fitScore/positiveFactors/riskFactors/
+// modelParamRange/conclusion) OHNE individuelle Handlungsanweisung — dieser
+// Block ist fuer ALLE Nutzer sichtbar. Die konkreten Zahlen (Strike/DTE/Delta/
+// Praemie) stehen jetzt in einem separaten optionsWatchlist[].ki_eic-Objekt,
+// das komplett entfernt wird statt einzelner Feldnamen. Alte KI_SENSITIVE_*-
+// Feldfilterung bleibt uebergangsweise zusaetzlich aktiv (Cache-Kompatibilitaet
+// mit noch nicht neu generierten KV-Eintraegen), kann nach vollstaendigem
+// Nightly-Batch-Durchlauf entfernt werden.
 //
 // Header: X-UIQ-Token: <token>           (fuer /sync/* — unveraendert)
-// Header: Authorization: Bearer <token>  (fuer /public/* — NEU in v2.1)
+// Header: Authorization: Bearer <token>  (fuer /public/* — seit v2.1)
 // Erlaubte Keys: watchlist, backlog_winners, backlog_oversold, backlog_tracking,
 //                scan_results, admin_settings, alert_watchlist
 // Endpoints:
 //   GET  /public/master_market_data   → Token-Pflicht, KI-Zahlenfelder nur fuer Owner
-//   GET  /public/options_watchlist    → Token-Pflicht, KI-Zahlenfelder nur fuer Owner
+//   GET  /public/options_watchlist    → Token-Pflicht, ki_eic nur fuer Owner
 //   GET  /public/daily_market_snapshot(_us) → Token-Pflicht (Inhalt unveraendert, schon deskriptiv)
 //   GET  /sync/status          → Status aller eigenen Keys
 //   GET  /sync/:key            → Eigenen Key lesen
@@ -52,14 +52,30 @@ const TOKEN_RE  = /^[a-zA-Z0-9_\-]+$/;
 // (v2.1, №61) — konkrete Handlungsparameter. Bleiben erhalten: strategy,
 // direction, riskClass, keyRisk, note (deskriptiv, kein Zahlenwert zum Handeln).
 const KI_SENSITIVE_SHORTLIST = ['trigger', 'stopLoss', 'target', 'crv', 'holdingDays', 'positionPct', 'leverageRec'];
-// dto. fuer optionsWatchlist[].ki — bleiben erhalten: strategy, riskClass, keyRisk, note.
-const KI_SENSITIVE_OPTIONS   = ['strikeSuggestion', 'dte', 'deltaTarget', 'premiumEstimate'];
+// Uebergangsfilter (v2.1-Altbestand) — dto. fuer optionsWatchlist[].ki, falls
+// noch alte, ungefilterte KV-Eintraege vorliegen. Neue Eintraege (v2.2) tragen
+// diese Werte stattdessen im separaten ki_eic-Objekt (s.u.).
+const KI_SENSITIVE_OPTIONS_LEGACY = ['strikeSuggestion', 'dte', 'deltaTarget', 'premiumEstimate'];
 
 function stripKiFields(item, sensitiveKeys) {
   if (!item || !item.ki) return item;
   const ki = { ...item.ki };
   for (const k of sensitiveKeys) delete ki[k];
   return { ...item, ki };
+}
+
+// v2.2: entfernt den kompletten ki_eic-Block (EIC-exklusive Zahlen) fuer
+// Nicht-Owner. Der ki-Block (Analyse: fitScore/positiveFactors/riskFactors/
+// modelParamRange/conclusion) enthaelt keine individuellen Handlungsanweisungen
+// mehr und bleibt fuer alle sichtbar.
+function stripKiEic(item) {
+  if (!item || !item.ki_eic) return item;
+  const { ki_eic, ...rest } = item;
+  return rest;
+}
+
+function sanitizeOptionsItem(item) {
+  return stripKiEic(stripKiFields(item, KI_SENSITIVE_OPTIONS_LEGACY));
 }
 
 function sanitizeMasterMarketData(obj) {
@@ -69,17 +85,17 @@ function sanitizeMasterMarketData(obj) {
   // Frontend liest optionsWatchlist primaer eingebettet aus master_market_data
   // (s. Kommentar oben, seit 30.06.2026) — hier ebenfalls filtern.
   if (obj && Array.isArray(obj.optionsWatchlist)) {
-    obj.optionsWatchlist = obj.optionsWatchlist.map(c => stripKiFields(c, KI_SENSITIVE_OPTIONS));
+    obj.optionsWatchlist = obj.optionsWatchlist.map(sanitizeOptionsItem);
   }
   return obj;
 }
 
 function sanitizeOptionsWatchlist(obj) {
   if (Array.isArray(obj)) {
-    return obj.map(c => stripKiFields(c, KI_SENSITIVE_OPTIONS));
+    return obj.map(sanitizeOptionsItem);
   }
   if (obj && Array.isArray(obj.tickers)) {
-    obj.tickers = obj.tickers.map(c => stripKiFields(c, KI_SENSITIVE_OPTIONS));
+    obj.tickers = obj.tickers.map(sanitizeOptionsItem);
   }
   return obj;
 }
@@ -251,7 +267,7 @@ export default {
       }));
       return new Response(JSON.stringify({
         status:  'ok',
-        service: 'ko-sync v2.1',
+        service: 'ko-sync v2.2',
         token:   token.slice(0, 3) + '***',  // nur Anfang zurückgeben (kein Full-Leak)
         time:    new Date().toISOString(),
         keys:    result
