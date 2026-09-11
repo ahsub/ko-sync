@@ -9,8 +9,7 @@ var ALLOWED_KEYS = /* @__PURE__ */ new Set([
   "backlog_tracking",
   "scan_results",
   "admin_settings",
-  "alert_watchlist",
-  "market_strip_snapshot"
+  "alert_watchlist"
 ]);
 var TOKEN_MIN = 6;
 var TOKEN_MAX = 32;
@@ -173,6 +172,34 @@ var ko_sync_worker_default = {
         return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: cors });
       }
     }
+    // NEU (11.09.2026): Public-Digest-Route (s. UEBERGABE-2026-09-10.md Punkt 4/
+    // "UIQ Public Daily Recommendations — Technical Implementation v1.0" §4).
+    // Liest den vorproduzierten Tages-Digest (KV-Key "public/digest/latest",
+    // geschrieben von generate_public_recommendations.js) — Voraussetzung fuer
+    // die geplante Frontend-Anbindung an openKiBriefing()/runAlphaLbKI(), die
+    // ohne diese Route ins Leere liefe (Route existierte bisher nicht, obwohl
+    // der Digest selbst schon produziert wird). Gleiches Auth-Muster wie die
+    // drei Routen oben (Bearer STATIC_TOKEN/OWNER_TOKEN), kein neues Secret,
+    // keine Sanitize-Funktion noetig — der Digest ist laut Schema (3.7) bereits
+    // bewusst ohne EIC-/sensible Felder gebaut.
+    if (path === "/public/digest" && request.method === "GET") {
+      const { isValid } = checkPublicAuth();
+      if (!isValid) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: cors });
+      }
+      try {
+        const raw = await env.KO_SYNC_KV.get("public/digest/latest", { type: "text" });
+        if (!raw) return new Response(
+          JSON.stringify({ ok: false, reason: "not_yet_generated" }),
+          { status: 404, headers: cors }
+        );
+        return new Response(raw, {
+          headers: { ...cors, "Content-Type": "application/json", "Cache-Control": "private, max-age=300" }
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: cors });
+      }
+    }
     const token = (request.headers.get("X-UIQ-Token") || "").trim();
     if (!token) {
       return new Response(JSON.stringify({
@@ -292,4 +319,3 @@ var ko_sync_worker_default = {
 export {
   ko_sync_worker_default as default
 };
-//# sourceMappingURL=ko-sync-worker.js.map
