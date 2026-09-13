@@ -1,5 +1,19 @@
-// ko-sync-worker.js v2.1
+// ko-sync-worker.js v2.3
 // Cloudflare Worker — KV-Sync für UnderlyingIQ mit Token-Isolation
+//
+// VERSIONSHINWEIS (13.09.2026, Claude+Axel): dieser Datei-Kopf sprang bisher
+// direkt von v2.1 auf diese Aenderung. index.html referenziert an zwei
+// Stellen (Kommentare zu v481/v482, 28.08.2026) bereits "ko-sync-worker.js
+// v2.2" fuer die dort beschriebene ki_eic-Stripping-Funktionalitaet
+// (stripKiEic()/sanitizeOptionsItem() unten) — diese Funktionen SIND in
+// dieser Datei bereits vorhanden und aktiv, nur der Datei-Kopf hier wurde
+// damals nie auf "v2.2" hochgezaehlt (blieb bei "v2.1", s. Aenderungs-
+// eintraege 27.08./11.09. unten, beide faelschlich noch als "v2.1" gefuehrt).
+// Um die Kollision mit dem bereits an anderer Stelle referenzierten "v2.2"
+// nicht zu wiederholen, wird DIESE Aenderung als v2.3 gefuehrt — TODO: bei
+// Gelegenheit rueckwirkend klaeren/dokumentieren, dass die 28.08.-Aenderung
+// nachtraeglich als v2.2 im Datei-Kopf ergaenzt gehoert (Single-Source-of-
+// Truth-Luecke, analog zum bekannten Muster bei anderen Dateien).
 //
 // ÄNDERUNG v2.0 (12.07.2026): Token-basierte Nutzer-Isolation
 // Jeder Nutzer setzt einmalig ein selbst gewähltes UIQ-Sync-Token (6-32 Zeichen).
@@ -23,6 +37,19 @@
 // keine Sanitize-Funktion nötig — der Digest ist laut Schema (Technical
 // Implementation v1.0, §3.7) bereits bewusst ohne EIC-/sensible Felder gebaut.
 //
+// ÄNDERUNG v2.3 (13.09.2026, Claude+Axel): neue Route
+// /public/ai_output/:strategy — liest die VOLLE, bereits nachts fertig
+// generierte KI-Narrative je Strategie (KV-Key "public/ai_output/latest/
+// {strategy}", NEU von generate_public_recommendations.js geschrieben,
+// zusätzlich zum bestehenden Archiv-Key). Grund: der Public Digest oben
+// enthält nur eine kurze, statisch-templatete rationale (kein Anthropic-
+// Text) — für die eigentliche Sprint-Absicht (volle KI-Narrative dem
+// Public-User zur Verfügung stellen, Cache-First statt täglich doppelter
+// Anthropic-Call) reicht /public/digest allein nicht aus. Nur für die 10
+// Equity-/KO-Strategien (AI_OUTPUT_STRATEGIES unten) — die 5 Options-
+// Strategien laufen (noch) nicht durch AI_delivery_public, s. Übergabe.
+// Gleiches Bearer-Auth-Muster, kein neues Secret.
+//
 // Header: X-UIQ-Token: <token>  (nur für /sync/* — /public/* nutzt Authorization: Bearer)
 // Erlaubte Keys: watchlist, backlog_winners, backlog_oversold, backlog_tracking,
 //                scan_results, admin_settings, alert_watchlist
@@ -32,6 +59,8 @@
 //   GET  /public/daily_market_snapshot  → öffentlich (Bearer-Token)
 //   GET  /public/daily_market_snapshot_us → öffentlich (Bearer-Token)
 //   GET  /public/digest                 → öffentlich (Bearer-Token)
+//   GET  /public/ai_output/:strategy    → öffentlich (Bearer-Token), nur die
+//                                          10 Equity-/KO-Strategien (NEU, v2.3)
 //   GET  /sync/status          → Status aller eigenen Keys
 //   GET  /sync/:key            → Eigenen Key lesen
 //   POST /sync/:key            → Eigenen Key schreiben
@@ -40,6 +69,19 @@
 const ALLOWED_KEYS = new Set([
   'watchlist', 'backlog_winners', 'backlog_oversold', 'backlog_tracking',
   'scan_results', 'admin_settings', 'alert_watchlist'
+]);
+
+// NEU (v2.3, 13.09.2026): Whitelist für /public/ai_output/:strategy — nur
+// diese 10 Strategien laufen durch AI_delivery_public und haben einen
+// "public/ai_output/latest/{strategy}"-Key. MUSS identisch bleiben zu
+// EQUITY_STRATEGIES in generate_public_recommendations.js (Object.keys von
+// STRAT_SCORE_FIELD dort) UND zu STRAT_SCORE_FIELD/DIGEST_CACHE_STRATEGIES
+// in index.html — bei künftiger Erweiterung auf die 5 Options-Strategien
+// alle drei Stellen mitpflegen (bekanntes Single-Source-of-Truth-Risiko,
+// s. Übergabeprotokolle 07.09./07.09.2026).
+const AI_OUTPUT_STRATEGIES = new Set([
+  'ko', 'momentum', 'breakout', 'vcp', 'swing',
+  'meanrev', 'breakdown', 'fading_short', 'dividend', 'value'
 ]);
 
 const TOKEN_MIN = 6;
@@ -232,6 +274,34 @@ export default {
       }
     }
 
+    // ── GET /public/ai_output/:strategy — volle KI-Narrative je Strategie ──────
+    // NEU (v2.3, 13.09.2026). Pfad-Segment nach dem Präfix ist die Strategie,
+    // gegen AI_OUTPUT_STRATEGIES geprüft (verhindert beliebige KV-Key-Zugriffe
+    // über den Pfad). Gleiches Auth wie /public/digest, keine Sanitize-Funktion
+    // nötig — dieselbe Public-Mode-Narrative, die generate_public_
+    // recommendations.js ohnehin schon regulatorisch gehärtet erzeugt.
+    if (path.indexOf('/public/ai_output/') === 0 && request.method === 'GET') {
+      const { isValid } = checkPublicAuth();
+      if (!isValid) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: cors });
+      }
+      const strategy = path.slice('/public/ai_output/'.length);
+      if (!AI_OUTPUT_STRATEGIES.has(strategy)) {
+        return new Response(JSON.stringify({ error: 'Unbekannte oder nicht unterstützte Strategie' }),
+          { status: 404, headers: cors });
+      }
+      try {
+        const raw = await env.KO_SYNC_KV.get(`public/ai_output/latest/${strategy}`, { type: 'text' });
+        if (!raw) return new Response(JSON.stringify({ ok: false, reason: 'not_yet_generated' }),
+          { status: 404, headers: cors });
+        return new Response(raw, {
+          headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'private, max-age=300' }
+        });
+      } catch(e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: cors });
+      }
+    }
+
     // ── Token lesen + validieren (nur /sync/*) ─────────────────────────────────
     const token = (request.headers.get('X-UIQ-Token') || '').trim();
 
@@ -274,7 +344,7 @@ export default {
       }));
       return new Response(JSON.stringify({
         status:  'ok',
-        service: 'ko-sync v2.1',
+        service: 'ko-sync v2.3',
         token:   token.slice(0, 3) + '***',  // nur Anfang zurückgeben (kein Full-Leak)
         time:    new Date().toISOString(),
         keys:    result
